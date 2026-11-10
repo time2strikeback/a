@@ -1,145 +1,234 @@
-# AXIOM Remote Assist - temporary support session for this PC.
-# Starts Microsoft's OpenSSH server for the current user only, reachable only
-# by the technician's key, through an outbound tunnel. Nothing is installed.
-# Everything is removed when the window is closed.
+# PowerShell launcher template; package public configuration before use.
 & {
-  $ErrorActionPreference = 'Stop'
-  $ProgressPreference = 'SilentlyContinue'
-  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-  $relayHost = '89.167.52.69'; $relayPort = 443; $relayUser = 'kit'
-  $relayHostKey = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJzQ8aATSwvQwsxeNw+oyHxzmhtU6W4a2djKwbn3Di/p'
-  $ownerKey = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICQDAuNo/O1vcTDkDYJuYIsMRnJquDi5SefUL5MoSkJZ axiom-assist-owner'
-  $zipUrl = 'https://github.com/PowerShell/Win32-OpenSSH/releases/download/10.4.0.0p1-Preview/OpenSSH-Win64.zip'
-  $zipHash = 'b67ff8becd203502190ec42ac7787c24c2cd3325ed7700485fe7a1c83d2a7957'
-
-  if (-not [Environment]::Is64BitOperatingSystem) { Write-Host 'This tool needs 64-bit Windows.'; return }
-  $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-  $sid = $identity.User.Value
-  $elevated = ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-  function Protect-File([string]$path) {
-    & icacls.exe $path /inheritance:r /grant:r "*${sid}:F" | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "Could not restrict permissions on $path" }
+function ConvertTo-AssistLogin([string]$AccountName,[string]$ComputerName) {
+  # Match portable v10.4 pwd.c: local SID-resolved names omit the machine prefix.
+  if($AccountName -notmatch '\A([^\\]+)\\([^\\]+)\z'){throw 'Expected a SID-resolved qualified Windows account name.'}
+  $authority=$Matches[1];$login=$Matches[2].ToLowerInvariant()
+  if(-not $ComputerName -or -not $authority.Equals($ComputerName,[StringComparison]::OrdinalIgnoreCase)){
+    throw 'AD domain and other nonlocal principals are not supported by Remote Assist v2.1; refusing launch.'
   }
-
-  $pin = $env:AXIOM_ASSIST_PIN
-  if (-not $pin) {
-    $secure = Read-Host 'Access PIN' -AsSecureString
-    $pin = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
-  }
-  if ($pin -notmatch '^[A-Za-z0-9]{6,32}$') { Write-Host 'PIN must be 6-32 letters or digits.'; return }
-
-  $session = Join-Path $env:TEMP ('axiom-assist-' + [guid]::NewGuid().ToString('N').Substring(0, 10))
-  $bin = Join-Path $session 'OpenSSH-Win64'
-  $sshd = $null; $tunnel = $null
+  if($login -notmatch '\A[a-z0-9_][a-z0-9_.-]*\z'){throw 'Local account name cannot be safely restricted in sshd_config and SSH arguments.'}
+  return $login
+}
+function Get-AssistLogin {
+  $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
+  $account=$identity.User.Translate([Security.Principal.NTAccount]).Value
+  ConvertTo-AssistLogin $account ([Environment]::MachineName)
+}
+function Request-AssistElevation([string]$ScriptText) {
+  $ErrorActionPreference='Stop'
+  # Packaged source exceeds Windows' command-line limit. Stage a private short-lived script.
+  $stage=Join-Path $env:TEMP ('axiom-assist-uac-'+[guid]::NewGuid().ToString('N'))
   try {
-    New-Item -ItemType Directory $session | Out-Null
-    Write-Host 'Preparing (downloading Microsoft OpenSSH, about 6 MB)...'
-    $zip = Join-Path $session 'openssh.zip'
-    if ($env:AXIOM_ASSIST_ZIP) { Copy-Item $env:AXIOM_ASSIST_ZIP $zip } else { Invoke-WebRequest -Uri $zipUrl -OutFile $zip -UseBasicParsing }
-    if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne $zipHash) { throw 'Download did not match the expected checksum.' }
-    Expand-Archive $zip -DestinationPath $session -Force
-    Remove-Item $zip -Force
+    [void](New-Item -ItemType Directory -Path $stage)
+    $acl=[Security.AccessControl.DirectorySecurity]::new()
+    $acl.SetAccessRuleProtection($true,$false)
+    foreach($sid in @([Security.Principal.WindowsIdentity]::GetCurrent().User.Value,'S-1-5-18','S-1-5-32-544')) {
+      [void]$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($sid),'FullControl','ContainerInherit,ObjectInherit','None','Allow'))
+    }
+    Set-Acl -LiteralPath $stage -AclObject $acl
+    $file=Join-Path $stage 'launch.ps1'
+    $selfRemove='Remove-Item -LiteralPath $PSCommandPath -Force; Remove-Item -LiteralPath $PSScriptRoot -Force' + [Environment]::NewLine
+    [IO.File]::WriteAllText($file,$selfRemove+$ScriptText,[Text.Encoding]::UTF8)
+    $p = Start-Process "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -Verb RunAs -PassThru -Wait -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$file`""
+    if ($p.ExitCode -ne 0) { throw "Elevated session exited with code $($p.ExitCode)" }
+  } catch { throw "Administrator authorization was denied or the elevated session failed. No unelevated fallback. $($_.Exception.Message)" }
+  finally { if(Test-Path -LiteralPath $stage){Remove-Item -LiteralPath $stage -Recurse -Force} }
+}
+function Get-AssistParent {
+  # Known machine folder, not caller-controlled TEMP. Do not change its ACL.
+  $parent=[Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
+  $cursor=$parent
+  while($cursor){
+    if((Get-Item -LiteralPath $cursor -Force).Attributes -band [IO.FileAttributes]::ReparsePoint){throw 'Unsafe session directory ancestry.'}
+    $acl=Get-Acl -LiteralPath $cursor
+    foreach($rule in $acl.Access){
+      if($rule.AccessControlType -ne 'Allow' -or ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly)){continue}
+      $sid=$rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+      if($sid -in @('S-1-5-18','S-1-5-32-544','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')){continue}
+      $danger=[Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor [Security.AccessControl.FileSystemRights]::Delete -bor [Security.AccessControl.FileSystemRights]::ChangePermissions -bor [Security.AccessControl.FileSystemRights]::TakeOwnership
+      if($rule.FileSystemRights -band $danger){throw 'Unprivileged delete/ACL rights on session directory ancestry; refusing launch.'}
+    }
+    $cursor=[IO.Path]::GetDirectoryName($cursor)
+  }
+  $parent
+}
+function Assert-AssistDirectory([string]$Path) {
+  $full = [IO.Path]::GetFullPath($Path).TrimEnd('\')
+  if ([IO.Path]::GetFileName($full) -notmatch '^axiom-assist-[a-f0-9]{32}$' -or
+      [IO.Path]::GetDirectoryName($full) -ne (Get-AssistParent).TrimEnd('\')) {
+    throw 'Not an exact temporary Remote Assist session directory.'
+  }
+  $cursor = $full
+  while ($cursor) {
+    if ((Test-Path -LiteralPath $cursor) -and ((Get-Item -LiteralPath $cursor -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Reparse point in session directory path.' }
+    $cursor = [IO.Path]::GetDirectoryName($cursor)
+  }
+  return $full
+}
+function New-AssistAcl([switch]$Directory) {
+  $acl = if ($Directory) { New-Object Security.AccessControl.DirectorySecurity } else { New-Object Security.AccessControl.FileSecurity }
+  $acl.SetAccessRuleProtection($true,$false)
+  $admins = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+  $acl.SetOwner($admins)
+  foreach ($sid in @('S-1-5-18','S-1-5-32-544')) {
+    $principal = [Security.Principal.SecurityIdentifier]::new($sid)
+    $rule = if ($Directory) { [Security.AccessControl.FileSystemAccessRule]::new($principal,'FullControl','ContainerInherit,ObjectInherit','None','Allow') } else { [Security.AccessControl.FileSystemAccessRule]::new($principal,'FullControl','Allow') }
+    [void]$acl.AddAccessRule($rule)
+  }
+  return $acl
+}
+function Protect-AssistPath([string]$Path, [switch]$Directory) {
+  Set-Acl -LiteralPath $Path -AclObject (New-AssistAcl -Directory:$Directory)
+}
+function New-AssistSession {
+  $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+  if (-not ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Administrator authorization is required.' }
+  $tag = [guid]::NewGuid().ToString('N')
+  $root = Join-Path (Get-AssistParent) "axiom-assist-$tag"
+  [void](Assert-AssistDirectory $root)
+  if(Test-Path -LiteralPath $root){throw 'Session directory collision.'}
+  # Apply the protected SYSTEM/Administrators DACL atomically, without a writable inheritance window.
+  [void][IO.Directory]::CreateDirectory($root,(New-AssistAcl -Directory))
+  [pscustomobject]@{ Root=$root; Name="AxiomAssist_$tag"; Created=$false; Port=0; ServerPid=0 }
+}
+function Invoke-AssistProcess([string]$File, [string]$Arguments, [int]$Timeout=25000) {
+  $psi = [Diagnostics.ProcessStartInfo]::new($File,$Arguments)
+  $psi.UseShellExecute=$false; $psi.CreateNoWindow=$true
+  $psi.RedirectStandardOutput=$true; $psi.RedirectStandardError=$true; $psi.RedirectStandardInput=$true
+  $p=[Diagnostics.Process]::Start($psi)
+  try {
+    $p.StandardInput.Close(); $o=$p.StandardOutput.ReadToEndAsync(); $e=$p.StandardError.ReadToEndAsync()
+    if (-not $p.WaitForExit($Timeout)) { $p.Kill(); throw "Process timed out: $([IO.Path]::GetFileName($File))" }
+    @{ Code=$p.ExitCode; Out=$o.Result; Err=$e.Result }
+  } finally { $p.Dispose() }
+}
 
-    $hostKey = Join-Path $session 'hostkey'
-    & (Join-Path $bin 'ssh-keygen.exe') -q -t ed25519 -N '""' -C 'axiom-assist-session' -f $hostKey
-    if ($LASTEXITCODE -ne 0) { throw 'Host key generation failed' }
-    $authorized = Join-Path $session 'authorized_keys'
-    Set-Content $authorized $ownerKey -Encoding ascii
-    Protect-File $hostKey; Protect-File $authorized
-
-    $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
-    $listener.Start(); $port = $listener.LocalEndpoint.Port; $listener.Stop()
-    $dir = $session -replace '\\', '/'
-    $config = Join-Path $session 'sshd_config'
+function Stop-AssistProcess($Process) {
+  if ($Process -and $Process.HasExited) { throw "Session process $($Process.Id) exited early; descendant cleanup cannot be verified." }
+  if ($Process) {
+    $result=Invoke-AssistProcess "$env:WINDIR\System32\taskkill.exe" "/PID $($Process.Id) /T /F"
+    if ($result.Code -ne 0) { throw "Unable to verify session process tree cleanup for $($Process.Id)." }
+    if (-not $Process.WaitForExit(5000)) { throw "Session process $($Process.Id) did not exit." }
+  }
+}
+function Assert-AssistToken($Token,[string]$ExpectedSid,[int]$ExpectedSession) {
+  if(-not $Token -or $Token.sid -ne $ExpectedSid -or $Token.admin -ne $true -or $Token.high -ne $true -or $Token.session -ne $ExpectedSession){throw 'Local SSH identity, administrator token, integrity or interactive session verification failed; relay access refused.'}
+}
+function Start-InteractiveAssist($deployment) {
+  $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
+  if(-not ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'Administrator authorization required; no session was started.'}
+  if(-not [Environment]::Is64BitOperatingSystem){throw '64-bit Windows is required.'}
+  $login=Get-AssistLogin
+  $sessionId=(Get-Process -Id $PID).SessionId
+  [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
+  $sessionState=$null; $sshd=$null; $tunnel=$null; $pin=$null; $primary=$null
+  try {
+    Write-Host "AXIOM Remote Assist: $env:COMPUTERNAME ($($identity.Name)), administrator authorized."
+    $secure=Read-Host 'Access PIN' -AsSecureString
+    $ptr=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+    try{$pin=[Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr)}finally{[Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr);$secure=$null}
+    if($pin -notmatch '^[A-Za-z0-9]{6,32}$'){throw 'PIN must be 6-32 letters or digits.'}
+    $sessionState=New-AssistSession; $root=$sessionState.Root
+    Write-Host "Temporary session directory: $root"
+    $zip=Join-Path $root 'openssh.zip'
+    Invoke-WebRequest -Uri 'https://github.com/PowerShell/Win32-OpenSSH/releases/download/10.4.0.0p1-Preview/OpenSSH-Win64.zip' -OutFile $zip -UseBasicParsing
+    if((Get-FileHash $zip -Algorithm SHA256).Hash -ne 'b67ff8becd203502190ec42ac7787c24c2cd3325ed7700485fe7a1c83d2a7957'){throw 'OpenSSH checksum mismatch.'}
+    Expand-Archive $zip -DestinationPath $root; Remove-Item -LiteralPath $zip
+    $bin=Join-Path $root 'OpenSSH-Win64'; $kg=Join-Path $bin 'ssh-keygen.exe'
+    $r=Invoke-AssistProcess $kg "-q -t ed25519 -N `"`" -f `"$root\hostkey`""
+    if($r.Code -ne 0){throw 'Host key generation failed.'}
+    [IO.File]::WriteAllText("$root\authorized_keys",$deployment.ownerKey+"`r`n",[Text.Encoding]::ASCII)
+    Protect-AssistPath "$root\hostkey"; Protect-AssistPath "$root\authorized_keys"
+    $listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0)
+    $listener.Start();$port=$listener.LocalEndpoint.Port;$listener.Stop()
+    $d=$root.Replace('\','/')
     @"
 Port $port
 ListenAddress 127.0.0.1
-HostKey $dir/hostkey
-AuthorizedKeysFile $dir/authorized_keys
-PidFile $dir/sshd.pid
+HostKey "$d/hostkey"
+AuthorizedKeysFile "$d/authorized_keys"
+PidFile "$d/sshd.pid"
+AllowUsers $login
+AuthenticationMethods publickey
 PubkeyAuthentication yes
 PasswordAuthentication no
 KbdInteractiveAuthentication no
+PermitEmptyPasswords no
 AllowTcpForwarding no
 AllowAgentForwarding no
 PermitTunnel no
-LogLevel VERBOSE
-Banner $dir/banner.txt
-PerSourcePenalties no
-Subsystem sftp "$dir/OpenSSH-Win64/sftp-server.exe"
-"@ | Set-Content $config -Encoding ascii
-    # The banner tells the technician's laptop which PC and user this is, so
-    # nothing has to be read out. Only the technician's key can reach this port.
-    $fingerprint = ((& (Join-Path $bin 'ssh-keygen.exe') -lf "$hostKey.pub") -split ' ')[1]
-    $about = [ordered]@{ computer = $env:COMPUTERNAME; user = $env:USERNAME; elevated = $elevated
-      fingerprint = $fingerprint; started = (Get-Date).ToString('s') } | ConvertTo-Json -Compress
-    Set-Content (Join-Path $session 'banner.txt') "AXIOM-ASSIST $about" -Encoding ascii
-    $sshd = Start-Process (Join-Path $bin 'sshd.exe') -PassThru -WindowStyle Hidden -ArgumentList @(
-      '-D', '-f', "`"$config`"", '-E', "`"$(Join-Path $session 'sshd.log')`"")
-    Start-Sleep -Milliseconds 1500
-    if ($sshd.HasExited) { throw "The local server could not start (code $($sshd.ExitCode))." }
-
-    # Outbound tunnel to the relay. The PIN is handed to ssh through a helper,
-    # then removed from this window's environment.
-    $known = Join-Path $session 'relay_known_hosts'
-    Set-Content $known "[$relayHost]:$relayPort $relayHostKey" -Encoding ascii
-    $askpass = Join-Path $session 'askpass.cmd'
-    Set-Content $askpass '@echo %AXIOM_ASSIST_PIN%' -Encoding ascii
-    $tunnelLog = Join-Path $session 'tunnel.log'
-    $env:AXIOM_ASSIST_PIN = $pin; $env:SSH_ASKPASS = $askpass; $env:SSH_ASKPASS_REQUIRE = 'force'
+PermitTTY no
+Banner "$d/banner.txt"
+Subsystem sftp "$d/OpenSSH-Win64/sftp-server.exe"
+"@ | Set-Content -LiteralPath "$root\sshd_config" -Encoding ascii
+    $r=Invoke-AssistProcess $kg "-lf `"$root\hostkey.pub`""
+    if($r.Code -ne 0){throw 'Cannot fingerprint host key.'};$fingerprint=($r.Out -split ' ')[1]
+    @{computer=$env:COMPUTERNAME;user=$login;elevated=$true;fingerprint=$fingerprint;started=(Get-Date).ToString('s')} | ConvertTo-Json -Compress | ForEach-Object {"AXIOM-ASSIST $_"} | Set-Content "$root\banner.txt" -Encoding ascii
+    $r=Invoke-AssistProcess "$bin\sshd.exe" "-t -f `"$root\sshd_config`""
+    if($r.Code -ne 0){throw "Isolated sshd configuration refused: $($r.Err)"}
+    $sshd=Start-Process "$bin\sshd.exe" -PassThru -WindowStyle Hidden -ArgumentList @('-D','-f',"`"$root\sshd_config`"",'-E',"`"$root\sshd.log`"")
     try {
-      $tunnel = Start-Process (Join-Path $bin 'ssh.exe') -PassThru -WindowStyle Hidden `
-        -RedirectStandardError $tunnelLog -RedirectStandardOutput (Join-Path $session 'tunnel.out') -ArgumentList @(
-        '-N', '-p', "$relayPort",
-        '-o', 'PreferredAuthentications=password', '-o', 'PubkeyAuthentication=no', '-o', 'NumberOfPasswordPrompts=1',
-        '-o', 'ExitOnForwardFailure=yes', '-o', 'ServerAliveInterval=20', '-o', 'ConnectTimeout=20',
-        '-o', 'StrictHostKeyChecking=yes', '-o', "`"UserKnownHostsFile=$known`"",
-        '-R', "127.0.0.1:0:127.0.0.1:$port", "$relayUser@$relayHost")
-      $code = $null
-      foreach ($attempt in 1..60) {
-        Start-Sleep -Milliseconds 500
-        $line = Select-String -Path $tunnelLog -Pattern 'Allocated port (\d+)' -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($line) { $code = $line.Matches[0].Groups[1].Value; break }
-        if ($tunnel.HasExited) { break }
+      $r=Invoke-AssistProcess $kg "-q -t ed25519 -N `"`" -f `"$root\probe`""
+      if($r.Code -ne 0){throw 'Cannot generate local probe key.'}
+      [IO.File]::WriteAllText("$root\authorized_keys",$deployment.ownerKey+"`r`n"+[IO.File]::ReadAllText("$root\probe.pub"),[Text.Encoding]::ASCII)
+      [IO.File]::WriteAllText("$root\probe_known_hosts","[127.0.0.1]:$port "+[IO.File]::ReadAllText("$root\hostkey.pub"),[Text.Encoding]::ASCII)
+      $script='[pscustomobject]@{sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;admin=([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator);session=(Get-Process -Id $PID).SessionId;high=([bool]((& whoami /groups) -match "S-1-16-12288"))}|ConvertTo-Json -Compress'
+      $encoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
+      $token=$null
+      for($i=0;$i -lt 20;$i++){
+        if($sshd.HasExited){throw 'Local SSH server exited before readiness.'}
+        $r=Invoke-AssistProcess "$bin\ssh.exe" "-F none -p $port -i `"$root\probe`" -o BatchMode=yes -o IdentitiesOnly=yes -o GlobalKnownHostsFile=none -o ConnectTimeout=2 -o StrictHostKeyChecking=yes -o `"UserKnownHostsFile=$root\probe_known_hosts`" $login@127.0.0.1 powershell -NoProfile -NonInteractive -EncodedCommand $encoded" 7000
+        if($r.Code -eq 0){try{$token=$r.Out|ConvertFrom-Json}catch{};break}; Start-Sleep -Milliseconds 300
       }
+      Assert-AssistToken $token $identity.User.Value $sessionId
     } finally {
-      Remove-Item Env:AXIOM_ASSIST_PIN, Env:SSH_ASKPASS, Env:SSH_ASKPASS_REQUIRE -ErrorAction SilentlyContinue
-      Remove-Item $askpass -Force -ErrorAction SilentlyContinue
+      [IO.File]::WriteAllText("$root\authorized_keys",$deployment.ownerKey+"`r`n",[Text.Encoding]::ASCII)
+      Remove-Item -LiteralPath "$root\probe","$root\probe.pub","$root\probe_known_hosts" -Force -ErrorAction SilentlyContinue
+      if((Test-Path "$root\probe") -or (Test-Path "$root\probe.pub")){throw 'Could not remove temporary probe key; relay access refused.'}
     }
-    if (-not $code) {
-      $why = (Get-Content $tunnelLog -ErrorAction SilentlyContinue | Select-Object -Last 3) -join ' '
-      if ($why -match 'Permission denied') { throw 'Wrong PIN, or too many wrong attempts from this network (wait a few minutes).' }
-      throw "Could not reach the relay. $why"
+    $known=Join-Path $root 'relay_known_hosts'
+    Set-Content $known "[$($deployment.relayHost)]:$($deployment.relayPort) $($deployment.relayHostKey)" -Encoding ascii
+    $pin | Set-Content "$root\pin.txt" -Encoding ascii; $pin=$null
+    Set-Content "$root\askpass.cmd" ('@type "'+$root+'\pin.txt"') -Encoding ascii
+    $env:SSH_ASKPASS="$root\askpass.cmd";$env:SSH_ASKPASS_REQUIRE='force'
+    $log="$root\tunnel.log"
+    try {
+      $tunnel=Start-Process "$bin\ssh.exe" -PassThru -WindowStyle Hidden -RedirectStandardError $log -RedirectStandardOutput "$root\tunnel.out" -ArgumentList @('-F','none','-N','-p',"$($deployment.relayPort)",'-o','GlobalKnownHostsFile=none','-o','PreferredAuthentications=password','-o','PubkeyAuthentication=no','-o','NumberOfPasswordPrompts=1','-o','ExitOnForwardFailure=yes','-o','ServerAliveInterval=20','-o','ConnectTimeout=20','-o','StrictHostKeyChecking=yes','-o',"`"UserKnownHostsFile=$known`"",'-R',"127.0.0.1:0:127.0.0.1:$port","kit@$($deployment.relayHost)")
+      $code=$null
+      for($i=0;$i -lt 60;$i++){Start-Sleep -Milliseconds 500;$line=Select-String -Path $log -Pattern 'Allocated port (\d+)' -ErrorAction SilentlyContinue | Select-Object -First 1;if($line){$code=$line.Matches[0].Groups[1].Value;break};if($tunnel.HasExited -or $sshd.HasExited){break}}
+    } finally {
+      Remove-Item Env:SSH_ASKPASS,Env:SSH_ASKPASS_REQUIRE -ErrorAction SilentlyContinue
+      Remove-Item -LiteralPath "$root\pin.txt","$root\askpass.cmd" -Force -ErrorAction SilentlyContinue
+      if((Test-Path "$root\pin.txt") -or (Test-Path "$root\askpass.cmd")){throw 'Could not remove PIN helper; disconnecting.'}
     }
-
-    if ($env:AXIOM_ASSIST_INFO) {
-      [ordered]@{ code = $code; localPort = $port; user = $env:USERNAME; computer = $env:COMPUTERNAME
-        elevated = $elevated; fingerprint = $fingerprint; sessionDir = $session } |
-        ConvertTo-Json | Set-Content $env:AXIOM_ASSIST_INFO -Encoding ascii
+    if(-not $code){
+      if((Get-Content -LiteralPath $log -ErrorAction SilentlyContinue) -match 'Permission denied'){throw 'Wrong PIN, or too many wrong attempts from this network (wait a few minutes). Access was not opened.'}
+      throw 'Relay authentication or forwarding failed; access was not opened.'
     }
-    Write-Host ''
-    Write-Host "  AXIOM Remote Assist - CONNECTED"
-    Write-Host "  This PC : $($env:COMPUTERNAME)  ($($env:USERNAME), admin: $elevated)"
-    Write-Host "  Session : $code    Fingerprint: $fingerprint"
-    Write-Host ''
-    Write-Host '  Press Enter or close this window to end access.'
-    if ($env:AXIOM_ASSIST_STOP) {
-      while (-not (Test-Path $env:AXIOM_ASSIST_STOP)) {
-        if ($sshd.HasExited -or $tunnel.HasExited) { throw 'The session ended unexpectedly.' }
-        Start-Sleep -Milliseconds 300
-      }
-    } else { [void][Console]::ReadLine() }
+    Write-Host "CONNECTED: $env:COMPUTERNAME ($login), administrator authorized. Session $code; fingerprint $fingerprint"
+    Write-Host 'Press Enter to disconnect. Abrupt window closure may leave processes or files behind.'
+    while($true){if([Console]::KeyAvailable -and [Console]::ReadKey($true).Key -eq [ConsoleKey]::Enter){break};if($sshd.HasExited -or $tunnel.HasExited){throw 'The session ended unexpectedly.'};Start-Sleep -Milliseconds 300}
   } catch {
-    Write-Host "  Error: $($_.Exception.Message)"
+    $primary=$_.Exception.Message; throw
   } finally {
-    foreach ($proc in $tunnel, $sshd) {
-      if ($proc -and -not $proc.HasExited) { try { $proc.Kill(); [void]$proc.WaitForExit(5000) } catch {} }
-    }
-    Get-Process sshd-session, sshd-auth, sshd, ssh -ErrorAction SilentlyContinue |
-      Where-Object { $_.Path -and $_.Path.StartsWith($session, [StringComparison]::OrdinalIgnoreCase) } |
-      ForEach-Object { try { $_.Kill() } catch {} }
-    Start-Sleep -Milliseconds 700
-    if (Test-Path $session) { Remove-Item $session -Recurse -Force -ErrorAction SilentlyContinue }
-    Write-Host '  Session closed. Temporary files removed.'
+    $pin=$null;$cleanupErrors=@()
+    foreach($process in @($tunnel,$sshd)){try{Stop-AssistProcess $process}catch{$cleanupErrors+= $_.Exception.Message}}
+    if($sessionState){try{[void](Assert-AssistDirectory $root);Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction Stop}catch{$cleanupErrors+= $_.Exception.Message}}
+    if($cleanupErrors.Count){throw "$(if($primary){"$primary "})Cleanup incomplete: $($cleanupErrors -join '; '). Session directory: $root"}
+    Write-Host 'Session disconnected; temporary files removed.'
   }
+}
+$config64='eyJyZWxheUhvc3RLZXkiOiJzc2gtZWQyNTUxOSBBQUFBQzNOemFDMWxaREkxTlRFNUFBQUFJSnpROGFBVFN3dlF3c3hlTncrb3lIeHptaHRVNlc0YTJkakt3Ym4zRGkvcCIsImxhdW5jaGVyVXJsIjoiaHR0cHM6Ly90aW1lMnN0cmlrZWJhY2suZ2l0aHViLmlvL2EiLCJvd25lcktleSI6InNzaC1lZDI1NTE5IEFBQUFDM056YUMxbFpESTFOVEU1QUFBQUlDUURBdU5vL08xdmNURGtEWUp1WUlzTVJuSnF1RGk1U2VmVUw1TW9Ta0paIGF4aW9tLWFzc2lzdC1vd25lciIsInJlbGF5SG9zdCI6Ijg5LjE2Ny41Mi42OSIsInJlbGF5UG9ydCI6NDQzfQ=='
+if($config64.StartsWith('REPLACE_')){throw 'Unconfigured source template. Build a separate deployment package first.'}
+$deployment=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($config64)) | ConvertFrom-Json
+$identity=[Security.Principal.WindowsIdentity]::GetCurrent()
+if(([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){
+  # The elevated window closes on exit; keep failures readable.
+  try{Start-InteractiveAssist $deployment}catch{Write-Host "Remote Assist stopped: $($_.Exception.Message)" -ForegroundColor Red;[void](Read-Host 'Press Enter to close');throw}
+}else{
+  $source=$MyInvocation.MyCommand.ScriptBlock.ToString()
+  Request-AssistElevation $source
+}
+
 }
