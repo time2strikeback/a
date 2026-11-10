@@ -1,0 +1,140 @@
+# AXIOM Remote Assist - temporary support session for this PC.
+# Starts Microsoft's OpenSSH server for the current user only, reachable only
+# by the technician's key, through an outbound tunnel. Nothing is installed.
+# Everything is removed when the window is closed.
+& {
+  $ErrorActionPreference = 'Stop'
+  $ProgressPreference = 'SilentlyContinue'
+  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+  $relayHost = '89.167.52.69'; $relayPort = 443; $relayUser = 'kit'
+  $relayHostKey = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJzQ8aATSwvQwsxeNw+oyHxzmhtU6W4a2djKwbn3Di/p'
+  $ownerKey = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICQDAuNo/O1vcTDkDYJuYIsMRnJquDi5SefUL5MoSkJZ axiom-assist-owner'
+  $zipUrl = 'https://github.com/PowerShell/Win32-OpenSSH/releases/download/10.4.0.0p1-Preview/OpenSSH-Win64.zip'
+  $zipHash = 'b67ff8becd203502190ec42ac7787c24c2cd3325ed7700485fe7a1c83d2a7957'
+
+  if (-not [Environment]::Is64BitOperatingSystem) { Write-Host 'This tool needs 64-bit Windows.'; return }
+  $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+  $sid = $identity.User.Value
+  $elevated = ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  function Protect-File([string]$path) {
+    & icacls.exe $path /inheritance:r /grant:r "*${sid}:F" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Could not restrict permissions on $path" }
+  }
+
+  $pin = $env:AXIOM_ASSIST_PIN
+  if (-not $pin) {
+    $secure = Read-Host 'Access PIN' -AsSecureString
+    $pin = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
+  }
+  if ($pin -notmatch '^[A-Za-z0-9]{6,32}$') { Write-Host 'PIN must be 6-32 letters or digits.'; return }
+
+  $session = Join-Path $env:TEMP ('axiom-assist-' + [guid]::NewGuid().ToString('N').Substring(0, 10))
+  $bin = Join-Path $session 'OpenSSH-Win64'
+  $sshd = $null; $tunnel = $null
+  try {
+    New-Item -ItemType Directory $session | Out-Null
+    Write-Host 'Preparing (downloading Microsoft OpenSSH, about 6 MB)...'
+    $zip = Join-Path $session 'openssh.zip'
+    if ($env:AXIOM_ASSIST_ZIP) { Copy-Item $env:AXIOM_ASSIST_ZIP $zip } else { Invoke-WebRequest -Uri $zipUrl -OutFile $zip -UseBasicParsing }
+    if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne $zipHash) { throw 'Download did not match the expected checksum.' }
+    Expand-Archive $zip -DestinationPath $session -Force
+    Remove-Item $zip -Force
+
+    $hostKey = Join-Path $session 'hostkey'
+    & (Join-Path $bin 'ssh-keygen.exe') -q -t ed25519 -N '""' -C 'axiom-assist-session' -f $hostKey
+    if ($LASTEXITCODE -ne 0) { throw 'Host key generation failed' }
+    $authorized = Join-Path $session 'authorized_keys'
+    Set-Content $authorized $ownerKey -Encoding ascii
+    Protect-File $hostKey; Protect-File $authorized
+
+    $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+    $listener.Start(); $port = $listener.LocalEndpoint.Port; $listener.Stop()
+    $dir = $session -replace '\\', '/'
+    $config = Join-Path $session 'sshd_config'
+    @"
+Port $port
+ListenAddress 127.0.0.1
+HostKey $dir/hostkey
+AuthorizedKeysFile $dir/authorized_keys
+PidFile $dir/sshd.pid
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+AllowTcpForwarding no
+AllowAgentForwarding no
+PermitTunnel no
+LogLevel VERBOSE
+Subsystem sftp "$dir/OpenSSH-Win64/sftp-server.exe"
+"@ | Set-Content $config -Encoding ascii
+    $sshd = Start-Process (Join-Path $bin 'sshd.exe') -PassThru -WindowStyle Hidden -ArgumentList @(
+      '-D', '-f', "`"$config`"", '-E', "`"$(Join-Path $session 'sshd.log')`"")
+    Start-Sleep -Milliseconds 1500
+    if ($sshd.HasExited) { throw "The local server could not start (code $($sshd.ExitCode))." }
+    $fingerprint = ((& (Join-Path $bin 'ssh-keygen.exe') -lf "$hostKey.pub") -split ' ')[1]
+
+    # Outbound tunnel to the relay. The PIN is handed to ssh through a helper,
+    # then removed from this window's environment.
+    $known = Join-Path $session 'relay_known_hosts'
+    Set-Content $known "[$relayHost]:$relayPort $relayHostKey" -Encoding ascii
+    $askpass = Join-Path $session 'askpass.cmd'
+    Set-Content $askpass '@echo %AXIOM_ASSIST_PIN%' -Encoding ascii
+    $tunnelLog = Join-Path $session 'tunnel.log'
+    $env:AXIOM_ASSIST_PIN = $pin; $env:SSH_ASKPASS = $askpass; $env:SSH_ASKPASS_REQUIRE = 'force'
+    try {
+      $tunnel = Start-Process (Join-Path $bin 'ssh.exe') -PassThru -WindowStyle Hidden `
+        -RedirectStandardError $tunnelLog -RedirectStandardOutput (Join-Path $session 'tunnel.out') -ArgumentList @(
+        '-N', '-p', "$relayPort",
+        '-o', 'PreferredAuthentications=password', '-o', 'PubkeyAuthentication=no', '-o', 'NumberOfPasswordPrompts=1',
+        '-o', 'ExitOnForwardFailure=yes', '-o', 'ServerAliveInterval=20', '-o', 'ConnectTimeout=20',
+        '-o', 'StrictHostKeyChecking=yes', '-o', "`"UserKnownHostsFile=$known`"",
+        '-R', "127.0.0.1:0:127.0.0.1:$port", "$relayUser@$relayHost")
+      $code = $null
+      foreach ($attempt in 1..60) {
+        Start-Sleep -Milliseconds 500
+        $line = Select-String -Path $tunnelLog -Pattern 'Allocated port (\d+)' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($line) { $code = $line.Matches[0].Groups[1].Value; break }
+        if ($tunnel.HasExited) { break }
+      }
+    } finally {
+      Remove-Item Env:AXIOM_ASSIST_PIN, Env:SSH_ASKPASS, Env:SSH_ASKPASS_REQUIRE -ErrorAction SilentlyContinue
+      Remove-Item $askpass -Force -ErrorAction SilentlyContinue
+    }
+    if (-not $code) {
+      $why = (Get-Content $tunnelLog -ErrorAction SilentlyContinue | Select-Object -Last 3) -join ' '
+      if ($why -match 'Permission denied') { throw 'Wrong PIN, or too many wrong attempts from this network (wait a few minutes).' }
+      throw "Could not reach the relay. $why"
+    }
+
+    if ($env:AXIOM_ASSIST_INFO) {
+      [ordered]@{ code = $code; localPort = $port; user = $env:USERNAME; computer = $env:COMPUTERNAME
+        elevated = $elevated; fingerprint = $fingerprint; sessionDir = $session } |
+        ConvertTo-Json | Set-Content $env:AXIOM_ASSIST_INFO -Encoding ascii
+    }
+    Write-Host ''
+    Write-Host '  AXIOM Remote Assist'
+    Write-Host "  Session code : $code"
+    Write-Host "  User         : $($env:USERNAME)"
+    Write-Host "  Computer     : $($env:COMPUTERNAME)    Admin: $elevated"
+    Write-Host "  Fingerprint  : $fingerprint"
+    Write-Host ''
+    Write-Host '  Press Enter or close this window to end access.'
+    if ($env:AXIOM_ASSIST_STOP) {
+      while (-not (Test-Path $env:AXIOM_ASSIST_STOP)) {
+        if ($sshd.HasExited -or $tunnel.HasExited) { throw 'The session ended unexpectedly.' }
+        Start-Sleep -Milliseconds 300
+      }
+    } else { [void][Console]::ReadLine() }
+  } catch {
+    Write-Host "  Error: $($_.Exception.Message)"
+  } finally {
+    foreach ($proc in $tunnel, $sshd) {
+      if ($proc -and -not $proc.HasExited) { try { $proc.Kill(); [void]$proc.WaitForExit(5000) } catch {} }
+    }
+    Get-Process sshd-session, sshd-auth, sshd, ssh -ErrorAction SilentlyContinue |
+      Where-Object { $_.Path -and $_.Path.StartsWith($session, [StringComparison]::OrdinalIgnoreCase) } |
+      ForEach-Object { try { $_.Kill() } catch {} }
+    Start-Sleep -Milliseconds 700
+    if (Test-Path $session) { Remove-Item $session -Recurse -Force -ErrorAction SilentlyContinue }
+    Write-Host '  Session closed. Temporary files removed.'
+  }
+}
