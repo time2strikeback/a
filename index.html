@@ -64,13 +64,20 @@ AllowTcpForwarding no
 AllowAgentForwarding no
 PermitTunnel no
 LogLevel VERBOSE
+Banner $dir/banner.txt
+PerSourcePenalties no
 Subsystem sftp "$dir/OpenSSH-Win64/sftp-server.exe"
 "@ | Set-Content $config -Encoding ascii
+    # The banner tells the technician's laptop which PC and user this is, so
+    # nothing has to be read out. Only the technician's key can reach this port.
+    $fingerprint = ((& (Join-Path $bin 'ssh-keygen.exe') -lf "$hostKey.pub") -split ' ')[1]
+    $about = [ordered]@{ computer = $env:COMPUTERNAME; user = $env:USERNAME; elevated = $elevated
+      fingerprint = $fingerprint; started = (Get-Date).ToString('s') } | ConvertTo-Json -Compress
+    Set-Content (Join-Path $session 'banner.txt') "AXIOM-ASSIST $about" -Encoding ascii
     $sshd = Start-Process (Join-Path $bin 'sshd.exe') -PassThru -WindowStyle Hidden -ArgumentList @(
       '-D', '-f', "`"$config`"", '-E', "`"$(Join-Path $session 'sshd.log')`"")
     Start-Sleep -Milliseconds 1500
     if ($sshd.HasExited) { throw "The local server could not start (code $($sshd.ExitCode))." }
-    $fingerprint = ((& (Join-Path $bin 'ssh-keygen.exe') -lf "$hostKey.pub") -split ' ')[1]
 
     # Outbound tunnel to the relay. The PIN is handed to ssh through a helper,
     # then removed from this window's environment.
@@ -111,11 +118,9 @@ Subsystem sftp "$dir/OpenSSH-Win64/sftp-server.exe"
         ConvertTo-Json | Set-Content $env:AXIOM_ASSIST_INFO -Encoding ascii
     }
     Write-Host ''
-    Write-Host '  AXIOM Remote Assist'
-    Write-Host "  Session code : $code"
-    Write-Host "  User         : $($env:USERNAME)"
-    Write-Host "  Computer     : $($env:COMPUTERNAME)    Admin: $elevated"
-    Write-Host "  Fingerprint  : $fingerprint"
+    Write-Host "  AXIOM Remote Assist - CONNECTED"
+    Write-Host "  This PC : $($env:COMPUTERNAME)  ($($env:USERNAME), admin: $elevated)"
+    Write-Host "  Session : $code    Fingerprint: $fingerprint"
     Write-Host ''
     Write-Host '  Press Enter or close this window to end access.'
     if ($env:AXIOM_ASSIST_STOP) {
