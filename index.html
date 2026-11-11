@@ -115,6 +115,82 @@ function Stop-AssistProcess($Process) {
 function Assert-AssistToken($Token,[string]$ExpectedSid,[int]$ExpectedSession) {
   if(-not $Token -or $Token.sid -ne $ExpectedSid -or $Token.admin -ne $true -or $Token.high -ne $true -or $Token.session -ne $ExpectedSession){throw 'Local SSH identity, administrator token, integrity or interactive session verification failed; relay access refused.'}
 }
+# No flashing windows, and closing the window always ends access:
+# sshd and the tunnel run on a private hidden desktop, inside a job that Windows kills when this window closes.
+function Initialize-AssistHidden {
+  if (-not ('AxiomHidden' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class AxiomHidden {
+  [DllImport("user32.dll", SetLastError=true, CharSet=CharSet.Unicode)] static extern IntPtr CreateDesktop(string n, IntPtr d, IntPtr m, int f, uint a, IntPtr s);
+  [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] struct SI { public int cb; public string r; public string desk; public string t; public int x,y,w,h,cx,cy,fill,flags; public short show,r2; public IntPtr r3,i,o,e; }
+  [StructLayout(LayoutKind.Sequential)] struct PI { public IntPtr hp, ht; public int pid, tid; }
+  [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)] static extern bool CreateProcess(string a, StringBuilder c, IntPtr pa, IntPtr ta, bool inh, uint fl, IntPtr env, string cwd, ref SI si, out PI pi);
+  [DllImport("kernel32.dll")] static extern uint ResumeThread(IntPtr h);
+  [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+  [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)] static extern IntPtr CreateJobObject(IntPtr a, string n);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool SetInformationJobObject(IntPtr j, int c, ref XL i, int l);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool AssignProcessToJobObject(IntPtr j, IntPtr p);
+  [StructLayout(LayoutKind.Sequential)] struct IOC { public ulong a,b,c,d,e,f; }
+  [StructLayout(LayoutKind.Sequential)] struct BL { public long t1,t2; public uint lim; public UIntPtr mn,mx; public uint apl; public UIntPtr aff; public uint pc,sc; }
+  [StructLayout(LayoutKind.Sequential)] struct XL { public BL b; public IOC io; public UIntPtr pm,jm,ppm,pjm; }
+  static IntPtr job = IntPtr.Zero, desk = IntPtr.Zero; static string name;
+  public static void Init(string desktopName) {
+    if (job != IntPtr.Zero) return;
+    job = CreateJobObject(IntPtr.Zero, null);
+    if (job == IntPtr.Zero) throw new Exception("CreateJobObject failed: " + Marshal.GetLastWin32Error());
+    var x = new XL(); x.b.lim = 0x2000; // kill every member when the last handle (this process) closes
+    if (!SetInformationJobObject(job, 9, ref x, Marshal.SizeOf(typeof(XL)))) throw new Exception("SetInformationJobObject failed: " + Marshal.GetLastWin32Error());
+    name = desktopName;
+    desk = CreateDesktop(name, IntPtr.Zero, IntPtr.Zero, 0, 0x10000000, IntPtr.Zero);
+    if (desk == IntPtr.Zero) throw new Exception("CreateDesktop failed: " + Marshal.GetLastWin32Error());
+  }
+  public static int Start(string commandLine, string cwd) {
+    var si = new SI(); si.cb = Marshal.SizeOf(typeof(SI)); si.desk = "WinSta0\\" + name; si.flags = 1; si.show = 0;
+    PI pi;
+    if (!CreateProcess(null, new StringBuilder(commandLine), IntPtr.Zero, IntPtr.Zero, false, 0x4 | 0x10 | 0x400, IntPtr.Zero, cwd, ref si, out pi))
+      throw new Exception("CreateProcess failed: " + Marshal.GetLastWin32Error());
+    if (!AssignProcessToJobObject(job, pi.hp)) { int e = Marshal.GetLastWin32Error(); CloseHandle(pi.ht); CloseHandle(pi.hp); throw new Exception("AssignProcessToJobObject failed: " + e); }
+    ResumeThread(pi.ht); CloseHandle(pi.ht); CloseHandle(pi.hp);
+    return pi.pid;
+  }
+}
+'@
+  }
+  [AxiomHidden]::Init('AxiomAssist' + [guid]::NewGuid().ToString('N').Substring(0, 12))
+}
+function Start-AssistHidden([string]$CommandLine, [string]$WorkingDirectory) {
+  $id = [AxiomHidden]::Start($CommandLine, $WorkingDirectory)
+  Get-Process -Id $id
+}
+# Windows hands every new console to the default terminal app (Windows Terminal), which opens on the visible
+# desktop. For the session only, use the classic console host, which stays on the hidden desktop.
+# The previous values are saved and restored on exit, or at the next launch if the window was force-closed.
+function Restore-AssistConsoleDelegation {
+  $backup = 'HKCU:\Software\AxiomAssist'; $key = 'HKCU:\Console\%%Startup'
+  if (-not (Test-Path -LiteralPath $backup)) { return }
+  $saved = Get-ItemProperty -LiteralPath $backup
+  foreach ($n in 'DelegationConsole', 'DelegationTerminal') {
+    $v = $saved."Saved$n"
+    if ($v -and $v -ne '<none>') { New-ItemProperty -LiteralPath $key -Name $n -Value $v -PropertyType String -Force | Out-Null }
+    else { Remove-ItemProperty -LiteralPath $key -Name $n -ErrorAction SilentlyContinue }
+  }
+  Remove-Item -LiteralPath $backup -Recurse -Force
+}
+function Set-AssistConsoleDelegation {
+  Restore-AssistConsoleDelegation
+  $backup = 'HKCU:\Software\AxiomAssist'; $key = 'HKCU:\Console\%%Startup'
+  if (-not (Test-Path -LiteralPath $key)) { New-Item -Path $key -Force | Out-Null }
+  $current = Get-ItemProperty -LiteralPath $key
+  New-Item -Path $backup -Force | Out-Null
+  foreach ($n in 'DelegationConsole', 'DelegationTerminal') {
+    $v = if ($current.$n) { $current.$n } else { '<none>' }
+    New-ItemProperty -LiteralPath $backup -Name "Saved$n" -Value $v -PropertyType String -Force | Out-Null
+    New-ItemProperty -LiteralPath $key -Name $n -Value '{B23D10C0-E52E-411E-9D5B-C09FDF709C7D}' -PropertyType String -Force | Out-Null
+  }
+}
 function Start-InteractiveAssist($deployment) {
   $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
   if(-not ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'Administrator authorization required; no session was started.'}
@@ -122,7 +198,7 @@ function Start-InteractiveAssist($deployment) {
   $login=Get-AssistLogin
   $sessionId=(Get-Process -Id $PID).SessionId
   [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
-  $sessionState=$null; $sshd=$null; $tunnel=$null; $pin=$null; $primary=$null
+  $sessionState=$null; $sshd=$null; $tunnel=$null; $pin=$null; $primary=$null; $delegationSet=$false
   try {
     Write-Host "AXIOM Remote Assist: $env:COMPUTERNAME ($($identity.Name)), administrator authorized."
     $secure=Read-Host 'Access PIN' -AsSecureString
@@ -167,7 +243,8 @@ Subsystem sftp "$d/OpenSSH-Win64/sftp-server.exe"
     @{computer=$env:COMPUTERNAME;user=$login;elevated=$true;fingerprint=$fingerprint;started=(Get-Date).ToString('s')} | ConvertTo-Json -Compress | ForEach-Object {"AXIOM-ASSIST $_"} | Set-Content "$root\banner.txt" -Encoding ascii
     $r=Invoke-AssistProcess "$bin\sshd.exe" "-t -f `"$root\sshd_config`""
     if($r.Code -ne 0){throw "Isolated sshd configuration refused: $($r.Err)"}
-    $sshd=Start-Process "$bin\sshd.exe" -PassThru -WindowStyle Hidden -ArgumentList @('-D','-f',"`"$root\sshd_config`"",'-E',"`"$root\sshd.log`"")
+    Initialize-AssistHidden; Set-AssistConsoleDelegation; $delegationSet=$true
+    $sshd=Start-AssistHidden "`"$bin\sshd.exe`" -D -f `"$root\sshd_config`" -E `"$root\sshd.log`"" $root
     try {
       $r=Invoke-AssistProcess $kg "-q -t ed25519 -N `"`" -f `"$root\probe`""
       if($r.Code -ne 0){throw 'Cannot generate local probe key.'}
@@ -194,7 +271,9 @@ Subsystem sftp "$d/OpenSSH-Win64/sftp-server.exe"
     $env:SSH_ASKPASS="$root\askpass.cmd";$env:SSH_ASKPASS_REQUIRE='force'
     $log="$root\tunnel.log"
     try {
-      $tunnel=Start-Process "$bin\ssh.exe" -PassThru -WindowStyle Hidden -RedirectStandardError $log -RedirectStandardOutput "$root\tunnel.out" -ArgumentList @('-F','none','-N','-p',"$($deployment.relayPort)",'-o','GlobalKnownHostsFile=none','-o','PreferredAuthentications=password','-o','PubkeyAuthentication=no','-o','NumberOfPasswordPrompts=1','-o','ExitOnForwardFailure=yes','-o','ServerAliveInterval=20','-o','ConnectTimeout=20','-o','StrictHostKeyChecking=yes','-o',"`"UserKnownHostsFile=$known`"",'-R',"127.0.0.1:0:127.0.0.1:$port","kit@$($deployment.relayHost)")
+      $tunnelArgs=@('-F','none','-N','-p',"$($deployment.relayPort)",'-o','GlobalKnownHostsFile=none','-o','PreferredAuthentications=password','-o','PubkeyAuthentication=no','-o','NumberOfPasswordPrompts=1','-o','ExitOnForwardFailure=yes','-o','ServerAliveInterval=20','-o','ConnectTimeout=20','-o','StrictHostKeyChecking=yes','-o',"`"UserKnownHostsFile=$known`"",'-R',"127.0.0.1:0:127.0.0.1:$port","kit@$($deployment.relayHost)")
+      # Through cmd only to capture ssh's stderr (the allocated port). Hidden desktop + job, like sshd.
+      $tunnel=Start-AssistHidden "`"$env:WINDIR\System32\cmd.exe`" /d /s /c `"`"$bin\ssh.exe`" $($tunnelArgs -join ' ') 2>`"$log`" >`"$root\tunnel.out`"`"" $root
       $code=$null
       for($i=0;$i -lt 60;$i++){Start-Sleep -Milliseconds 500;$line=Select-String -Path $log -Pattern 'Allocated port (\d+)' -ErrorAction SilentlyContinue | Select-Object -First 1;if($line){$code=$line.Matches[0].Groups[1].Value;break};if($tunnel.HasExited -or $sshd.HasExited){break}}
     } finally {
@@ -214,6 +293,7 @@ Subsystem sftp "$d/OpenSSH-Win64/sftp-server.exe"
   } finally {
     $pin=$null;$cleanupErrors=@()
     foreach($process in @($tunnel,$sshd)){try{Stop-AssistProcess $process}catch{$cleanupErrors+= $_.Exception.Message}}
+    if($delegationSet){try{Restore-AssistConsoleDelegation}catch{$cleanupErrors+= "Default terminal setting not restored: $($_.Exception.Message)"}}
     if($sessionState){try{[void](Assert-AssistDirectory $root);Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction Stop}catch{$cleanupErrors+= $_.Exception.Message}}
     if($cleanupErrors.Count){throw "$(if($primary){"$primary "})Cleanup incomplete: $($cleanupErrors -join '; '). Session directory: $root"}
     Write-Host 'Session disconnected; temporary files removed.'
