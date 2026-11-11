@@ -7,7 +7,8 @@ function ConvertTo-AssistLogin([string]$AccountName,[string]$ComputerName) {
   if(-not $ComputerName -or -not $authority.Equals($ComputerName,[StringComparison]::OrdinalIgnoreCase)){
     throw 'AD domain and other nonlocal principals are not supported by Remote Assist v2.1; refusing launch.'
   }
-  if($login -notmatch '\A[a-z0-9_][a-z0-9_.-]*\z'){throw 'Local account name cannot be safely restricted in sshd_config and SSH arguments.'}
+  # Letters (any language), digits, spaces, _ . - ; always quoted in sshd_config and SSH arguments.
+  if($login -notmatch '\A[\p{L}\p{Nd}_][\p{L}\p{Nd}_ .-]*\z' -or $login.EndsWith(' ') -or $login.Contains('  ')){throw 'Local account name cannot be safely restricted in sshd_config and SSH arguments.'}
   return $login
 }
 function Get-AssistLogin {
@@ -225,7 +226,7 @@ ListenAddress 127.0.0.1
 HostKey "$d/hostkey"
 AuthorizedKeysFile "$d/authorized_keys"
 PidFile "$d/sshd.pid"
-AllowUsers $login
+AllowUsers "$login"
 AuthenticationMethods publickey
 PubkeyAuthentication yes
 PasswordAuthentication no
@@ -255,7 +256,7 @@ Subsystem sftp "$d/OpenSSH-Win64/sftp-server.exe"
       $token=$null
       for($i=0;$i -lt 20;$i++){
         if($sshd.HasExited){throw 'Local SSH server exited before readiness.'}
-        $r=Invoke-AssistProcess "$bin\ssh.exe" "-F none -p $port -i `"$root\probe`" -o BatchMode=yes -o IdentitiesOnly=yes -o GlobalKnownHostsFile=none -o ConnectTimeout=2 -o StrictHostKeyChecking=yes -o `"UserKnownHostsFile=$root\probe_known_hosts`" $login@127.0.0.1 powershell -NoProfile -NonInteractive -EncodedCommand $encoded" 7000
+        $r=Invoke-AssistProcess "$bin\ssh.exe" "-F none -p $port -i `"$root\probe`" -o BatchMode=yes -o IdentitiesOnly=yes -o GlobalKnownHostsFile=none -o ConnectTimeout=2 -o StrictHostKeyChecking=yes -o `"UserKnownHostsFile=$root\probe_known_hosts`" `"$login@127.0.0.1`" powershell -NoProfile -NonInteractive -EncodedCommand $encoded" 7000
         if($r.Code -eq 0){try{$token=$r.Out|ConvertFrom-Json}catch{};break}; Start-Sleep -Milliseconds 300
       }
       Assert-AssistToken $token $identity.User.Value $sessionId
