@@ -1,4 +1,6 @@
 # PowerShell launcher template; package public configuration before use.
+# Runs on Windows PowerShell 2.0 (Windows 7) through 5.1: no PowerShell 3+ syntax or .NET 4+ calls
+# unless guarded (test\Test-Ps2Compat.ps1 enforces this).
 & {
 function ConvertTo-AssistLogin([string]$AccountName,[string]$ComputerName) {
   # Match portable v10.4 pwd.c: local SID-resolved names omit the machine prefix.
@@ -22,14 +24,14 @@ function Request-AssistElevation([string]$ScriptText) {
   $stage=Join-Path $env:TEMP ('axiom-assist-uac-'+[guid]::NewGuid().ToString('N'))
   try {
     [void](New-Item -ItemType Directory -Path $stage)
-    $acl=[Security.AccessControl.DirectorySecurity]::new()
+    $acl=New-Object Security.AccessControl.DirectorySecurity
     $acl.SetAccessRuleProtection($true,$false)
     foreach($sid in @([Security.Principal.WindowsIdentity]::GetCurrent().User.Value,'S-1-5-18','S-1-5-32-544')) {
-      [void]$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($sid),'FullControl','ContainerInherit,ObjectInherit','None','Allow'))
+      [void]$acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier($sid)),'FullControl','ContainerInherit,ObjectInherit','None','Allow')))
     }
     Set-Acl -LiteralPath $stage -AclObject $acl
     $file=Join-Path $stage 'launch.ps1'
-    $selfRemove='Remove-Item -LiteralPath $PSCommandPath -Force; Remove-Item -LiteralPath $PSScriptRoot -Force' + [Environment]::NewLine
+    $selfRemove='$assistSelf=$MyInvocation.MyCommand.Path; if($assistSelf){Remove-Item -LiteralPath $assistSelf -Force; Remove-Item -LiteralPath ([IO.Path]::GetDirectoryName($assistSelf)) -Force}' + [Environment]::NewLine
     [IO.File]::WriteAllText($file,$selfRemove+$ScriptText,[Text.Encoding]::UTF8)
     $p = Start-Process "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -Verb RunAs -PassThru -Wait -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$file`""
     if ($p.ExitCode -ne 0) { throw "Elevated session exited with code $($p.ExitCode)" }
@@ -46,7 +48,7 @@ function Get-AssistParent {
     foreach($rule in $acl.Access){
       if($rule.AccessControlType -ne 'Allow' -or ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly)){continue}
       $sid=$rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
-      if($sid -in @('S-1-5-18','S-1-5-32-544','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464')){continue}
+      if(@('S-1-5-18','S-1-5-32-544','S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464') -contains $sid){continue}
       $danger=[Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor [Security.AccessControl.FileSystemRights]::Delete -bor [Security.AccessControl.FileSystemRights]::ChangePermissions -bor [Security.AccessControl.FileSystemRights]::TakeOwnership
       if($rule.FileSystemRights -band $danger){throw 'Unprivileged delete/ACL rights on session directory ancestry; refusing launch.'}
     }
@@ -70,11 +72,11 @@ function Assert-AssistDirectory([string]$Path) {
 function New-AssistAcl([switch]$Directory) {
   $acl = if ($Directory) { New-Object Security.AccessControl.DirectorySecurity } else { New-Object Security.AccessControl.FileSecurity }
   $acl.SetAccessRuleProtection($true,$false)
-  $admins = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+  $admins = New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')
   $acl.SetOwner($admins)
   foreach ($sid in @('S-1-5-18','S-1-5-32-544')) {
-    $principal = [Security.Principal.SecurityIdentifier]::new($sid)
-    $rule = if ($Directory) { [Security.AccessControl.FileSystemAccessRule]::new($principal,'FullControl','ContainerInherit,ObjectInherit','None','Allow') } else { [Security.AccessControl.FileSystemAccessRule]::new($principal,'FullControl','Allow') }
+    $principal = New-Object Security.Principal.SecurityIdentifier($sid)
+    $rule = if ($Directory) { New-Object Security.AccessControl.FileSystemAccessRule($principal,'FullControl','ContainerInherit,ObjectInherit','None','Allow') } else { New-Object Security.AccessControl.FileSystemAccessRule($principal,'FullControl','Allow') }
     [void]$acl.AddAccessRule($rule)
   }
   return $acl
@@ -91,18 +93,74 @@ function New-AssistSession {
   if(Test-Path -LiteralPath $root){throw 'Session directory collision.'}
   # Apply the protected SYSTEM/Administrators DACL atomically, without a writable inheritance window.
   [void][IO.Directory]::CreateDirectory($root,(New-AssistAcl -Directory))
-  [pscustomobject]@{ Root=$root; Name="AxiomAssist_$tag"; Created=$false; Port=0; ServerPid=0 }
+  New-Object PSObject -Property @{ Root=$root; Name="AxiomAssist_$tag"; Created=$false; Port=0; ServerPid=0 }
 }
 function Invoke-AssistProcess([string]$File, [string]$Arguments, [int]$Timeout=25000) {
-  $psi = [Diagnostics.ProcessStartInfo]::new($File,$Arguments)
-  $psi.UseShellExecute=$false; $psi.CreateNoWindow=$true
-  $psi.RedirectStandardOutput=$true; $psi.RedirectStandardError=$true; $psi.RedirectStandardInput=$true
-  $p=[Diagnostics.Process]::Start($psi)
-  try {
-    $p.StandardInput.Close(); $o=$p.StandardOutput.ReadToEndAsync(); $e=$p.StandardError.ReadToEndAsync()
-    if (-not $p.WaitForExit($Timeout)) { $p.Kill(); throw "Process timed out: $([IO.Path]::GetFileName($File))" }
-    @{ Code=$p.ExitCode; Out=$o.Result; Err=$e.Result }
-  } finally { $p.Dispose() }
+  # Windowless child with stdout and stderr read on two threads (no deadlock); C# 2.0 for PowerShell 2.0.
+  if (-not ('AxiomProc' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Threading;
+public class AxiomProc {
+  StreamReader reader; Thread thread; string text = "";
+  AxiomProc(StreamReader r) { reader = r; thread = new Thread(new ThreadStart(Read)); thread.IsBackground = true; thread.Start(); }
+  void Read() { try { text = reader.ReadToEnd(); } catch (IOException) { } }
+  public static string[] Run(string file, string arguments, int timeout) {
+    ProcessStartInfo psi = new ProcessStartInfo(file, arguments);
+    psi.UseShellExecute = false; psi.CreateNoWindow = true;
+    psi.RedirectStandardOutput = true; psi.RedirectStandardError = true; psi.RedirectStandardInput = true;
+    Process p = Process.Start(psi);
+    try {
+      p.StandardInput.Close();
+      AxiomProc o = new AxiomProc(p.StandardOutput); AxiomProc e = new AxiomProc(p.StandardError);
+      if (!p.WaitForExit(timeout)) { try { p.Kill(); } catch (Exception) { } return null; }
+      o.thread.Join(5000); e.thread.Join(5000);
+      return new string[] { p.ExitCode.ToString(), o.text, e.text };
+    } finally { p.Close(); }
+  }
+}
+'@
+  }
+  $r = [AxiomProc]::Run($File, $Arguments, $Timeout)
+  if ($null -eq $r) { throw "Process timed out: $([IO.Path]::GetFileName($File))" }
+  @{ Code=[int]$r[0]; Out=$r[1]; Err=$r[2] }
+}
+# JSON and file helpers that also work on PowerShell 2.0 / .NET 3.5.
+function ConvertFrom-AssistJson([string]$Text) {
+  if (Get-Command ConvertFrom-Json -ErrorAction SilentlyContinue) { return ($Text | ConvertFrom-Json) }   # ps2-guarded
+  [void][Reflection.Assembly]::LoadWithPartialName('System.Web.Extensions')
+  $map = (New-Object Web.Script.Serialization.JavaScriptSerializer).DeserializeObject($Text)
+  $o = New-Object PSObject
+  foreach ($k in $map.Keys) { $o | Add-Member NoteProperty $k $map[$k] }
+  $o
+}
+function ConvertTo-AssistJsonString([string]$Value) {
+  $sb = New-Object Text.StringBuilder; [void]$sb.Append('"')
+  foreach ($c in $Value.ToCharArray()) {
+    $n = [int]$c
+    if ($c -eq '"' -or $c -eq '\') { [void]$sb.Append('\').Append($c) }
+    elseif ($n -lt 0x20 -or $n -gt 0x7e) { [void]$sb.Append('\u').Append($n.ToString('x4')) }
+    else { [void]$sb.Append($c) }
+  }
+  [void]$sb.Append('"'); $sb.ToString()
+}
+function Get-AssistSha256([string]$Path) {
+  try { $h = New-Object Security.Cryptography.SHA256CryptoServiceProvider } catch { $h = [Security.Cryptography.SHA256]::Create() }
+  $f = [IO.File]::OpenRead($Path)
+  try { [BitConverter]::ToString($h.ComputeHash($f)).Replace('-','') } finally { $f.Close() }
+}
+function Expand-AssistZip([string]$Zip, [string]$Destination, [string]$Expect) {
+  if (Get-Command Expand-Archive -ErrorAction SilentlyContinue) { Expand-Archive -LiteralPath $Zip -DestinationPath $Destination }   # ps2-guarded
+  else {
+    # Windows' own zip folder support (PowerShell 2.0): no progress UI, no prompts.
+    $shell = New-Object -ComObject Shell.Application
+    $shell.NameSpace($Destination).CopyHere($shell.NameSpace($Zip).Items(), 0x614)
+    for ($i = 0; $i -lt 240 -and -not (Test-Path -LiteralPath $Expect); $i++) { Start-Sleep -Milliseconds 250 }
+    Start-Sleep -Milliseconds 500
+  }
+  if (-not (Test-Path -LiteralPath $Expect)) { throw 'OpenSSH archive could not be extracted.' }
 }
 
 function Stop-AssistProcess($Process) {
@@ -118,7 +176,7 @@ function Assert-AssistToken($Token,[string]$ExpectedSid,[int]$ExpectedSession) {
 }
 # No flashing windows, and closing the window always ends access:
 # sshd and the tunnel run on a private hidden desktop, inside a job that Windows kills when this window closes.
-function Initialize-AssistHidden {
+function Initialize-AssistHidden([switch]$ForceSingleJob) {
   if (-not ('AxiomHidden' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
@@ -131,28 +189,51 @@ public static class AxiomHidden {
   [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)] static extern bool CreateProcess(string a, StringBuilder c, IntPtr pa, IntPtr ta, bool inh, uint fl, IntPtr env, string cwd, ref SI si, out PI pi);
   [DllImport("kernel32.dll")] static extern uint ResumeThread(IntPtr h);
   [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+  [StructLayout(LayoutKind.Sequential)] struct SA { public int n; public IntPtr d; public bool inherit; }
+  [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)] static extern IntPtr CreateFile(string f, uint acc, uint share, ref SA sa, uint disp, uint attr, IntPtr t);
   [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)] static extern IntPtr CreateJobObject(IntPtr a, string n);
   [DllImport("kernel32.dll", SetLastError=true)] static extern bool SetInformationJobObject(IntPtr j, int c, ref XL i, int l);
   [DllImport("kernel32.dll", SetLastError=true)] static extern bool AssignProcessToJobObject(IntPtr j, IntPtr p);
   [StructLayout(LayoutKind.Sequential)] struct IOC { public ulong a,b,c,d,e,f; }
   [StructLayout(LayoutKind.Sequential)] struct BL { public long t1,t2; public uint lim; public UIntPtr mn,mx; public uint apl; public UIntPtr aff; public uint pc,sc; }
   [StructLayout(LayoutKind.Sequential)] struct XL { public BL b; public IOC io; public UIntPtr pm,jm,ppm,pjm; }
-  static IntPtr job = IntPtr.Zero, desk = IntPtr.Zero; static string name;
-  public static void Init(string desktopName) {
+  static IntPtr job = IntPtr.Zero, desk = IntPtr.Zero; static string name; static bool legacy;
+  // legacy = Windows 7: a process can be in only one job, and OpenSSH puts each remote command in its own job.
+  // There, members' children silently leave this job (sshd and the tunnel stay in it and still die with the window).
+  public static void Init(string desktopName, bool singleJobOs) {
     if (job != IntPtr.Zero) return;
+    legacy = singleJobOs;
     job = CreateJobObject(IntPtr.Zero, null);
     if (job == IntPtr.Zero) throw new Exception("CreateJobObject failed: " + Marshal.GetLastWin32Error());
-    var x = new XL(); x.b.lim = 0x2000; // kill every member when the last handle (this process) closes
+    XL x = new XL(); x.b.lim = legacy ? 0x3000u : 0x2000u; // 0x2000 kill members when this process closes; 0x1000 silent breakaway
     if (!SetInformationJobObject(job, 9, ref x, Marshal.SizeOf(typeof(XL)))) throw new Exception("SetInformationJobObject failed: " + Marshal.GetLastWin32Error());
     name = desktopName;
     desk = CreateDesktop(name, IntPtr.Zero, IntPtr.Zero, 0, 0x10000000, IntPtr.Zero);
     if (desk == IntPtr.Zero) throw new Exception("CreateDesktop failed: " + Marshal.GetLastWin32Error());
   }
-  public static int Start(string commandLine, string cwd) {
-    var si = new SI(); si.cb = Marshal.SizeOf(typeof(SI)); si.desk = "WinSta0\\" + name; si.flags = 1; si.show = 0;
-    PI pi;
-    if (!CreateProcess(null, new StringBuilder(commandLine), IntPtr.Zero, IntPtr.Zero, false, 0x4 | 0x10 | 0x400, IntPtr.Zero, cwd, ref si, out pi))
-      throw new Exception("CreateProcess failed: " + Marshal.GetLastWin32Error());
+  static IntPtr Open(string file, uint access, uint disposition) {
+    SA sa = new SA(); sa.n = Marshal.SizeOf(typeof(SA)); sa.inherit = true;
+    IntPtr h = CreateFile(file, access, 7, ref sa, disposition, 0x80, IntPtr.Zero); // share read/write/delete
+    if (h == new IntPtr(-1)) throw new Exception("CreateFile failed for " + file + ": " + Marshal.GetLastWin32Error());
+    return h;
+  }
+  // logFile: the child's stderr goes straight to this file (read live by the launcher), stdout to logFile.out,
+  // stdin is NUL. Two separate handles: Windows OpenSSH stalls when stdout and stderr share one.
+  public static int Start(string commandLine, string cwd, string logFile) {
+    SI si = new SI(); si.cb = Marshal.SizeOf(typeof(SI)); si.desk = "WinSta0\\" + name; si.flags = 1; si.show = 0;
+    IntPtr hin = IntPtr.Zero, hout = IntPtr.Zero, herr = IntPtr.Zero; bool inherit = !String.IsNullOrEmpty(logFile);
+    PI pi = new PI(); uint fl = 0x4 | 0x10 | 0x400; bool ok = false;
+    try {
+      if (inherit) {
+        hin = Open("NUL", 0x80000000, 3);                                    // GENERIC_READ, OPEN_EXISTING
+        hout = Open(logFile + ".out", 0x40000000, 2); herr = Open(logFile, 0x40000000, 2);   // GENERIC_WRITE, CREATE_ALWAYS
+        si.flags |= 0x100; si.i = hin; si.o = hout; si.e = herr;             // STARTF_USESTDHANDLES
+      }
+      // Windows 7: leave any job this window was started in (if allowed), so ours can be assigned.
+      if (legacy) ok = CreateProcess(null, new StringBuilder(commandLine), IntPtr.Zero, IntPtr.Zero, inherit, fl | 0x01000000, IntPtr.Zero, cwd, ref si, out pi);
+      if (!ok && !CreateProcess(null, new StringBuilder(commandLine), IntPtr.Zero, IntPtr.Zero, inherit, fl, IntPtr.Zero, cwd, ref si, out pi))
+        throw new Exception("CreateProcess failed: " + Marshal.GetLastWin32Error());
+    } finally { if (hin != IntPtr.Zero) CloseHandle(hin); if (hout != IntPtr.Zero) CloseHandle(hout); if (herr != IntPtr.Zero) CloseHandle(herr); }
     if (!AssignProcessToJobObject(job, pi.hp)) { int e = Marshal.GetLastWin32Error(); CloseHandle(pi.ht); CloseHandle(pi.hp); throw new Exception("AssignProcessToJobObject failed: " + e); }
     ResumeThread(pi.ht); CloseHandle(pi.ht); CloseHandle(pi.hp);
     return pi.pid;
@@ -160,10 +241,11 @@ public static class AxiomHidden {
 }
 '@
   }
-  [AxiomHidden]::Init('AxiomAssist' + [guid]::NewGuid().ToString('N').Substring(0, 12))
+  [AxiomHidden]::Init('AxiomAssist' + [guid]::NewGuid().ToString('N').Substring(0, 12), [bool]($ForceSingleJob -or (Test-AssistSingleJobOs)))
 }
-function Start-AssistHidden([string]$CommandLine, [string]$WorkingDirectory) {
-  $id = [AxiomHidden]::Start($CommandLine, $WorkingDirectory)
+function Test-AssistSingleJobOs { [Environment]::OSVersion.Version -lt (New-Object Version 6, 2) }   # Windows 7 / Server 2008 R2
+function Start-AssistHidden([string]$CommandLine, [string]$WorkingDirectory, [string]$LogFile) {
+  $id = [AxiomHidden]::Start($CommandLine, $WorkingDirectory, $LogFile)
   Get-Process -Id $id
 }
 # Windows hands every new console to the default terminal app (Windows Terminal), which opens on the visible
@@ -195,10 +277,11 @@ function Set-AssistConsoleDelegation {
 function Start-InteractiveAssist($deployment) {
   $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
   if(-not ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'Administrator authorization required; no session was started.'}
-  if(-not [Environment]::Is64BitOperatingSystem){throw '64-bit Windows is required.'}
+  if(@('AMD64','ARM64') -notcontains $env:PROCESSOR_ARCHITECTURE -and @('AMD64','ARM64') -notcontains $env:PROCESSOR_ARCHITEW6432){throw '64-bit Windows is required.'}
   $login=Get-AssistLogin
   $sessionId=(Get-Process -Id $PID).SessionId
-  [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
+  # 3072 = TLS 1.2 (named Tls12 only from .NET 4.5). Windows 7 needs its .NET TLS 1.2 update (KB3154518 or a later rollup).
+  try{[Net.ServicePointManager]::SecurityProtocol=3072}catch{throw 'This PC cannot use TLS 1.2 yet. Install Windows updates (Windows 7: .NET update KB3154518 or later), then try again.'}
   $sessionState=$null; $sshd=$null; $tunnel=$null; $pin=$null; $primary=$null; $delegationSet=$false
   try {
     Write-Host "AXIOM Remote Assist: $env:COMPUTERNAME ($($identity.Name)), administrator authorized."
@@ -209,15 +292,16 @@ function Start-InteractiveAssist($deployment) {
     $sessionState=New-AssistSession; $root=$sessionState.Root
     Write-Host "Temporary session directory: $root"
     $zip=Join-Path $root 'openssh.zip'
-    Invoke-WebRequest -Uri 'https://github.com/PowerShell/Win32-OpenSSH/releases/download/10.4.0.0p1-Preview/OpenSSH-Win64.zip' -OutFile $zip -UseBasicParsing
-    if((Get-FileHash $zip -Algorithm SHA256).Hash -ne 'b67ff8becd203502190ec42ac7787c24c2cd3325ed7700485fe7a1c83d2a7957'){throw 'OpenSSH checksum mismatch.'}
-    Expand-Archive $zip -DestinationPath $root; Remove-Item -LiteralPath $zip
+    Write-Host 'Downloading Microsoft OpenSSH (about 5 MB)...'
+    (New-Object Net.WebClient).DownloadFile('https://github.com/PowerShell/Win32-OpenSSH/releases/download/10.4.0.0p1-Preview/OpenSSH-Win64.zip',$zip)
+    if((Get-AssistSha256 $zip) -ne 'b67ff8becd203502190ec42ac7787c24c2cd3325ed7700485fe7a1c83d2a7957'){throw 'OpenSSH checksum mismatch.'}
     $bin=Join-Path $root 'OpenSSH-Win64'; $kg=Join-Path $bin 'ssh-keygen.exe'
+    Expand-AssistZip $zip $root (Join-Path $bin 'sshd-session.exe'); Remove-Item -LiteralPath $zip
     $r=Invoke-AssistProcess $kg "-q -t ed25519 -N `"`" -f `"$root\hostkey`""
     if($r.Code -ne 0){throw 'Host key generation failed.'}
     [IO.File]::WriteAllText("$root\authorized_keys",$deployment.ownerKey+"`r`n",[Text.Encoding]::ASCII)
     Protect-AssistPath "$root\hostkey"; Protect-AssistPath "$root\authorized_keys"
-    $listener=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0)
+    $listener=New-Object Net.Sockets.TcpListener([Net.IPAddress]::Loopback,0)
     $listener.Start();$port=$listener.LocalEndpoint.Port;$listener.Stop()
     $d=$root.Replace('\','/')
     @"
@@ -241,23 +325,30 @@ Subsystem sftp "$d/OpenSSH-Win64/sftp-server.exe"
 "@ | Set-Content -LiteralPath "$root\sshd_config" -Encoding ascii
     $r=Invoke-AssistProcess $kg "-lf `"$root\hostkey.pub`""
     if($r.Code -ne 0){throw 'Cannot fingerprint host key.'};$fingerprint=($r.Out -split ' ')[1]
-    @{computer=$env:COMPUTERNAME;user=$login;elevated=$true;fingerprint=$fingerprint;started=(Get-Date).ToString('s')} | ConvertTo-Json -Compress | ForEach-Object {"AXIOM-ASSIST $_"} | Set-Content "$root\banner.txt" -Encoding ascii
+    $j={param($v) ConvertTo-AssistJsonString $v}   # ASCII-only JSON: non-English account names travel as \u escapes
+    ('AXIOM-ASSIST {"computer":'+(& $j $env:COMPUTERNAME)+',"user":'+(& $j $login)+',"elevated":true,"fingerprint":'+(& $j $fingerprint)+',"started":'+(& $j (Get-Date).ToString('s'))+'}') | Set-Content "$root\banner.txt" -Encoding ascii
     $r=Invoke-AssistProcess "$bin\sshd.exe" "-t -f `"$root\sshd_config`""
     if($r.Code -ne 0){throw "Isolated sshd configuration refused: $($r.Err)"}
-    Initialize-AssistHidden; Set-AssistConsoleDelegation; $delegationSet=$true
+    Initialize-AssistHidden
+    if([Environment]::OSVersion.Version.Major -ge 10){Set-AssistConsoleDelegation; $delegationSet=$true}   # default-terminal handoff exists only on Windows 10/11
     $sshd=Start-AssistHidden "`"$bin\sshd.exe`" -D -f `"$root\sshd_config`" -E `"$root\sshd.log`"" $root
     try {
       $r=Invoke-AssistProcess $kg "-q -t ed25519 -N `"`" -f `"$root\probe`""
       if($r.Code -ne 0){throw 'Cannot generate local probe key.'}
       [IO.File]::WriteAllText("$root\authorized_keys",$deployment.ownerKey+"`r`n"+[IO.File]::ReadAllText("$root\probe.pub"),[Text.Encoding]::ASCII)
       [IO.File]::WriteAllText("$root\probe_known_hosts","[127.0.0.1]:$port "+[IO.File]::ReadAllText("$root\hostkey.pub"),[Text.Encoding]::ASCII)
-      $script='[pscustomobject]@{sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;admin=([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator);session=(Get-Process -Id $PID).SessionId;high=([bool]((& whoami /groups) -match "S-1-16-12288"))}|ConvertTo-Json -Compress'
+      # Plain text, not JSON: the PC may only have PowerShell 2.0.
+      $script='$i=[Security.Principal.WindowsIdentity]::GetCurrent();"AXIOMTOKEN|"+$i.User.Value+"|"+([Security.Principal.WindowsPrincipal]$i).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)+"|"+(Get-Process -Id $PID).SessionId+"|"+([bool]((& whoami /groups) -match "S-1-16-12288"))'
       $encoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
       $token=$null
       for($i=0;$i -lt 20;$i++){
         if($sshd.HasExited){throw 'Local SSH server exited before readiness.'}
         $r=Invoke-AssistProcess "$bin\ssh.exe" "-F none -p $port -i `"$root\probe`" -o BatchMode=yes -o IdentitiesOnly=yes -o GlobalKnownHostsFile=none -o ConnectTimeout=2 -o StrictHostKeyChecking=yes -o `"UserKnownHostsFile=$root\probe_known_hosts`" `"$login@127.0.0.1`" powershell -NoProfile -NonInteractive -EncodedCommand $encoded" 7000
-        if($r.Code -eq 0){try{$token=$r.Out|ConvertFrom-Json}catch{};break}; Start-Sleep -Milliseconds 300
+        if($r.Code -eq 0){
+          $m=[regex]::Match($r.Out,'AXIOMTOKEN\|(S-[0-9-]+)\|(True|False)\|(\d+)\|(True|False)')
+          if($m.Success){$token=@{sid=$m.Groups[1].Value;admin=($m.Groups[2].Value -eq 'True');session=[int]$m.Groups[3].Value;high=($m.Groups[4].Value -eq 'True')}}
+          break
+        }; Start-Sleep -Milliseconds 300
       }
       Assert-AssistToken $token $identity.User.Value $sessionId
     } finally {
@@ -273,8 +364,9 @@ Subsystem sftp "$d/OpenSSH-Win64/sftp-server.exe"
     $log="$root\tunnel.log"
     try {
       $tunnelArgs=@('-F','none','-N','-p',"$($deployment.relayPort)",'-o','GlobalKnownHostsFile=none','-o','PreferredAuthentications=password','-o','PubkeyAuthentication=no','-o','NumberOfPasswordPrompts=1','-o','ExitOnForwardFailure=yes','-o','ServerAliveInterval=20','-o','ConnectTimeout=20','-o','StrictHostKeyChecking=yes','-o',"`"UserKnownHostsFile=$known`"",'-R',"127.0.0.1:0:127.0.0.1:$port","kit@$($deployment.relayHost)")
-      # Through cmd only to capture ssh's stderr (the allocated port). Hidden desktop + job, like sshd.
-      $tunnel=Start-AssistHidden "`"$env:WINDIR\System32\cmd.exe`" /d /s /c `"`"$bin\ssh.exe`" $($tunnelArgs -join ' ') 2>`"$log`" >`"$root\tunnel.out`"`"" $root
+      # ssh's output (including the allocated port) goes straight to the log file; no cmd in between, so ssh is
+      # itself a member of the kill-on-close job on every Windows version. (ssh -E would hold the log until exit.)
+      $tunnel=Start-AssistHidden "`"$bin\ssh.exe`" $($tunnelArgs -join ' ')" $root $log
       $code=$null
       for($i=0;$i -lt 60;$i++){Start-Sleep -Milliseconds 500;$line=Select-String -Path $log -Pattern 'Allocated port (\d+)' -ErrorAction SilentlyContinue | Select-Object -First 1;if($line){$code=$line.Matches[0].Groups[1].Value;break};if($tunnel.HasExited -or $sshd.HasExited){break}}
     } finally {
@@ -302,7 +394,7 @@ Subsystem sftp "$d/OpenSSH-Win64/sftp-server.exe"
 }
 $config64='eyJyZWxheUhvc3RLZXkiOiJzc2gtZWQyNTUxOSBBQUFBQzNOemFDMWxaREkxTlRFNUFBQUFJSnpROGFBVFN3dlF3c3hlTncrb3lIeHptaHRVNlc0YTJkakt3Ym4zRGkvcCIsImxhdW5jaGVyVXJsIjoiaHR0cHM6Ly90aW1lMnN0cmlrZWJhY2suZ2l0aHViLmlvL2EiLCJvd25lcktleSI6InNzaC1lZDI1NTE5IEFBQUFDM056YUMxbFpESTFOVEU1QUFBQUlDUURBdU5vL08xdmNURGtEWUp1WUlzTVJuSnF1RGk1U2VmVUw1TW9Ta0paIGF4aW9tLWFzc2lzdC1vd25lciIsInJlbGF5SG9zdCI6Ijg5LjE2Ny41Mi42OSIsInJlbGF5UG9ydCI6NDQzfQ=='
 if($config64.StartsWith('REPLACE_')){throw 'Unconfigured source template. Build a separate deployment package first.'}
-$deployment=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($config64)) | ConvertFrom-Json
+$deployment=ConvertFrom-AssistJson ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($config64)))
 $identity=[Security.Principal.WindowsIdentity]::GetCurrent()
 if(([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){
   # The elevated window closes on exit; keep failures readable.
